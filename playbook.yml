@@ -1,95 +1,132 @@
 ---
-- name: Deploy details_app on remote server
+- name: Deploy details_app on remote Debian servers
   hosts: details_app_server
   become: true
+  gather_facts: true
 
   vars:
-    app_user: details_app
-    app_dir: /home/details_app/app
-    service_file: details_app.service
-    repo_url: "https://github.com/YOUR-USERNAME/details_app_ansible_deploy.git"
+    app_user: docker
+    app_home: /home/docker/details_app
+    service_file_src: files/details_app.service
+    service_name: details_app.service
+    ssh_key_path: ~/.ssh/id_ansible
+
+  pre_tasks:
+    - name: Generate SSH key on control node if not present
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.openssh_keypair:
+        path: "{{ ssh_key_path }}"
+        type: rsa
+        size: 4096
+      register: ssh_key
+
+    - name: Read public SSH key content
+      delegate_to: localhost
+      run_once: true
+      ansible.builtin.slurp:
+        src: "{{ ssh_key_path }}.pub"
+      register: public_key_content
 
   tasks:
-    - name: Ensure the app user exists
-      user:
+    - name: Ensure app user '{{ app_user }}' exists
+      ansible.builtin.user:
         name: "{{ app_user }}"
-        home: "/home/{{ app_user }}"
-        shell: /bin/bash
         state: present
         create_home: yes
+        shell: /bin/bash
 
-    - name: Ensure Python3 is installed
-      apt:
-        name: python3
+    - name: Add control node public key to authorized_keys for '{{ app_user }}'
+      ansible.builtin.authorized_key:
+        user: "{{ app_user }}"
         state: present
-        update_cache: yes
+        key: "{{ public_key_content.content | b64decode }}"
 
-    - name: Install required packages
-      apt:
+    - name: Install Python3 and pip on Debian
+      ansible.builtin.apt:
         name:
-          - git
+          - python3
           - python3-pip
+          - python3-venv
         state: present
         update_cache: yes
 
-    - name: Copy application files to remote
-      copy:
-        src: details_app/
-        dest: "{{ app_dir }}/"
+    - name: Create app directory
+      ansible.builtin.file:
+        path: "{{ app_home }}"
+        state: directory
         owner: "{{ app_user }}"
         group: "{{ app_user }}"
         mode: '0755'
 
-    - name: Install Python dependencies
-      pip:
-        requirements: "{{ app_dir }}/requirements.txt"
-        virtualenv: "{{ app_dir }}/venv"
-        virtualenv_command: python3 -m venv
+    - name: Copy Flask app files to remote host
+      ansible.builtin.copy:
+        src: details_app/
+        dest: "{{ app_home }}/"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0644'
+      notify:
+        - Restart details_app service
+
+    - name: Install app dependencies with pip
+      ansible.builtin.pip:
+        requirements: "{{ app_home }}/requirements.txt"
+        executable: pip3
+        virtualenv: "{{ app_home }}/venv"
         virtualenv_python: python3
+        virtualenv_command: python3 -m venv
+        virtualenv_site_packages: no
+        state: present
+      become_user: "{{ app_user }}"
 
     - name: Copy systemd service file
-      copy:
-        src: "files/{{ service_file }}"
-        dest: "/etc/systemd/system/{{ service_file }}"
+      ansible.builtin.copy:
+        src: "{{ service_file_src }}"
+        dest: "/etc/systemd/system/{{ service_name }}"
         owner: root
         group: root
         mode: '0644'
-
-    - name: Reload systemd
-      systemd:
-        daemon_reload: yes
+      notify:
+        - Reload systemd
+        - Restart details_app service
 
     - name: Enable and start the details_app service
-      systemd:
-        name: "{{ service_file }}"
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
         enabled: yes
         state: started
 
-    - name: Wait for app to be available
-      wait_for:
+  handlers:
+    - name: Reload systemd
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Restart details_app service
+      ansible.builtin.systemd:
+        name: "{{ service_name }}"
+        state: restarted
+
+  post_tasks:
+    - name: Reboot the remote server to verify startup on boot
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+        test_command: systemctl is-active {{ service_name }}
+
+    - name: Wait for port 8000 to be open on remote server
+      ansible.builtin.wait_for:
+        host: "{{ inventory_hostname }}"
         port: 8000
-        delay: 5
-        timeout: 30
-
-    - name: Reboot the machine
-      reboot:
-
-    - name: Wait for server to come back online
-      wait_for_connection:
-        timeout: 300
-
-    - name: Ensure service is running after reboot
-      systemd:
-        name: "{{ service_file }}"
+        timeout: 60
         state: started
-        enabled: yes
 
-    - name: Check the app health endpoint
-      uri:
-        url: http://localhost:8000/health
+    - name: Verify the details_app is up by checking /health endpoint
+      ansible.builtin.uri:
+        url: "http://{{ inventory_hostname }}:8000/health"
         return_content: yes
-      register: result
+        status_code: 200
+      register: health_response
 
-    - name: Print health check result
-      debug:
-        msg: "Health Check Response: {{ result.content }}"
+    - name: Show health endpoint response
+      ansible.builtin.debug:
+        msg: "Health check response from {{ inventory_hostname }}: {{ health_response.content }}"
