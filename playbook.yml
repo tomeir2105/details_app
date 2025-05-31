@@ -1,0 +1,95 @@
+---
+- name: Deploy details_app on remote server
+  hosts: details_app_server
+  become: true
+
+  vars:
+    app_user: details_app
+    app_dir: /home/details_app/app
+    service_file: details_app.service
+    repo_url: "https://github.com/YOUR-USERNAME/details_app_ansible_deploy.git"
+
+  tasks:
+    - name: Ensure the app user exists
+      user:
+        name: "{{ app_user }}"
+        home: "/home/{{ app_user }}"
+        shell: /bin/bash
+        state: present
+        create_home: yes
+
+    - name: Ensure Python3 is installed
+      apt:
+        name: python3
+        state: present
+        update_cache: yes
+
+    - name: Install required packages
+      apt:
+        name:
+          - git
+          - python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Copy application files to remote
+      copy:
+        src: details_app/
+        dest: "{{ app_dir }}/"
+        owner: "{{ app_user }}"
+        group: "{{ app_user }}"
+        mode: '0755'
+
+    - name: Install Python dependencies
+      pip:
+        requirements: "{{ app_dir }}/requirements.txt"
+        virtualenv: "{{ app_dir }}/venv"
+        virtualenv_command: python3 -m venv
+        virtualenv_python: python3
+
+    - name: Copy systemd service file
+      copy:
+        src: "files/{{ service_file }}"
+        dest: "/etc/systemd/system/{{ service_file }}"
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start the details_app service
+      systemd:
+        name: "{{ service_file }}"
+        enabled: yes
+        state: started
+
+    - name: Wait for app to be available
+      wait_for:
+        port: 8000
+        delay: 5
+        timeout: 30
+
+    - name: Reboot the machine
+      reboot:
+
+    - name: Wait for server to come back online
+      wait_for_connection:
+        timeout: 300
+
+    - name: Ensure service is running after reboot
+      systemd:
+        name: "{{ service_file }}"
+        state: started
+        enabled: yes
+
+    - name: Check the app health endpoint
+      uri:
+        url: http://localhost:8000/health
+        return_content: yes
+      register: result
+
+    - name: Print health check result
+      debug:
+        msg: "Health Check Response: {{ result.content }}"
