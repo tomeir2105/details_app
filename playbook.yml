@@ -1,56 +1,41 @@
 ---
 - name: Deploy details_app on remote Debian servers
   hosts: details_app_server
-  become: true
-  gather_facts: true
-
-  vars:
-    app_user: docker
-    app_home: /home/docker/details_app
-    service_file_src: files/details_app.service
-    service_name: details_app.service
-    ssh_key_path: "{{ lookup('env','HOME') + '/.ssh/id_ansible' }}"
-    ssh_pub_key_path: "{{ ssh_key_path }}.pub"
+  become: yes
+  gather_facts: yes
 
   pre_tasks:
-    - name: Generate SSH key on control node if not exists
-      delegate_to: localhost
-      ansible.builtin.openssh_keypair:
-        path: "{{ ssh_key_path }}"
-        size: 4096
-        type: rsa
-      register: ssh_key_result
-      run_once: true
-
-    - name: Read generated public key from control node
-      delegate_to: localhost
-      ansible.builtin.slurp:
-        src: "{{ ssh_pub_key_path }}"
-      register: pubkey_content
-      run_once: true
-
-    - name: Add generated SSH public key to remote user's authorized_keys
-      ansible.builtin.authorized_key:
-        user: "{{ app_user }}"
-        key: "{{ pubkey_content.content | b64decode }}"
-      become: false
-
-    - name: Verify the remote OS is Debian
+    - name: Check that remote OS is Debian-based
       ansible.builtin.assert:
         that:
           - ansible_facts['os_family'] == "Debian"
-        fail_msg: "This playbook only supports Debian-based systems. Detected OS family: {{ ansible_facts['os_family'] }}"
-        success_msg: "Confirmed Debian-based system."
+        fail_msg: "Target host is not Debian based. Aborting."
 
   tasks:
-    - name: Ensure app user '{{ app_user }}' exists
+    - name: Create details_app user if not present
       ansible.builtin.user:
-        name: "{{ app_user }}"
-        state: present
-        create_home: yes
+        name: docker
         shell: /bin/bash
+        create_home: yes
+      when: ansible_facts['getent_passwd']['docker'] is not defined
 
-    - name: Install Python3, pip and venv on Debian
+    - name: Ensure /home/docker/details_app directory exists
+      ansible.builtin.file:
+        path: /home/docker/details_app
+        state: directory
+        owner: docker
+        group: docker
+        mode: '0755'
+
+    - name: Copy details_app source code to remote
+      ansible.builtin.copy:
+        src: details_app/
+        dest: /home/docker/details_app/
+        owner: docker
+        group: docker
+        mode: '0755'
+
+    - name: Install python3, pip, and python3-venv
       ansible.builtin.apt:
         name:
           - python3
@@ -59,80 +44,71 @@
         state: present
         update_cache: yes
 
-    - name: Create app directory
-      ansible.builtin.file:
-        path: "{{ app_home }}"
-        state: directory
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        mode: '0755'
+    - name: Create python virtual environment
+      ansible.builtin.command:
+        cmd: python3 -m venv /home/docker/details_app/venv
+      args:
+        creates: /home/docker/details_app/venv/bin/activate
+      become_user: docker
 
-    - name: Copy Flask app files to remote host
-      ansible.builtin.copy:
-        src: details_app/
-        dest: "{{ app_home }}/"
-        owner: "{{ app_user }}"
-        group: "{{ app_user }}"
-        mode: '0644'
-      notify:
-        - Restart details_app service
-
-    - name: Install app dependencies with pip in virtualenv
+    - name: Install python requirements in venv
       ansible.builtin.pip:
-        requirements: "{{ app_home }}/requirements.txt"
-        virtualenv: "{{ app_home }}/venv"
+        requirements: /home/docker/details_app/requirements.txt
+        virtualenv: /home/docker/details_app/venv
         virtualenv_python: python3
-        virtualenv_site_packages: no
-        state: present
-      become_user: "{{ app_user }}"
+      become_user: docker
 
     - name: Copy systemd service file
       ansible.builtin.copy:
-        src: "{{ service_file_src }}"
-        dest: "/etc/systemd/system/{{ service_name }}"
+        src: files/details_app.service
+        dest: /etc/systemd/system/details_app.service
         owner: root
         group: root
         mode: '0644'
-      notify:
-        - Reload systemd
-        - Restart details_app service
 
-    - name: Enable and start the details_app service
-      ansible.builtin.systemd:
-        name: "{{ service_name }}"
-        enabled: yes
-        state: started
-
-  handlers:
-    - name: Reload systemd
+    - name: Reload systemd daemon
       ansible.builtin.systemd:
         daemon_reload: yes
 
-    - name: Restart details_app service
+    - name: Enable and start details_app service
       ansible.builtin.systemd:
-        name: "{{ service_name }}"
-        state: restarted
-
-  post_tasks:
-    - name: Reboot the remote server to verify startup on boot
-      ansible.builtin.reboot:
-        reboot_timeout: 300
-        test_command: systemctl is-active {{ service_name }}
-
-    - name: Wait for port 8000 to be open on remote server
-      ansible.builtin.wait_for:
-        host: "{{ inventory_hostname }}"
-        port: 8000
-        timeout: 60
+        name: details_app.service
+        enabled: yes
         state: started
 
-    - name: Verify the details_app is up by checking /health endpoint
+    - name: Wait for details_app service to be responsive
       ansible.builtin.uri:
-        url: "http://{{ inventory_hostname }}:8000/health"
-        return_content: yes
+        url: http://localhost:8000/health
         status_code: 200
-      register: health_response
+        timeout: 10
+      register: health_check
+      retries: 5
+      delay: 5
+      until: health_check.status == 200
 
-    - name: Show health endpoint response
-      ansible.builtin.debug:
-        msg: "Health check response from {{ inventory_hostname }}: {{ health_response.content }}"
+    - name: Reboot remote server to test service persistence
+      ansible.builtin.reboot:
+        reboot_timeout: 300
+
+    - name: Wait for SSH after reboot
+      ansible.builtin.wait_for:
+        port: 22
+        host: "{{ inventory_hostname }}"
+        timeout: 300
+        state: started
+
+    - name: Verify details_app service is running after reboot
+      ansible.builtin.systemd:
+        name: details_app.service
+        state: started
+        enabled: yes
+
+    - name: Check application health endpoint after reboot
+      ansible.builtin.uri:
+        url: http://localhost:8000/health
+        status_code: 200
+        timeout: 10
+      register: health_check_after_reboot
+      retries: 5
+      delay: 5
+      until: health_check_after_reboot.status == 200
