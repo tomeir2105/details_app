@@ -1,0 +1,13 @@
+[Unit]
+Description=Details App Service
+After=network.target
+
+[Service]
+User=details_app
+WorkingDirectory=/home/details_app/app
+ExecStart=/home/details_app/app/venv/bin/python3 app.py
+Restart=always
+Environment=APP_ENV=production
+
+[Install]
+WantedBy=multi-user.target
