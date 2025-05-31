@@ -9,24 +9,38 @@
     app_home: /home/docker/details_app
     service_file_src: files/details_app.service
     service_name: details_app.service
-    ssh_key_path: ~/.ssh/id_ansible
+    ssh_key_path: "{{ lookup('env','HOME') + '/.ssh/id_ansible' }}"
+    ssh_pub_key_path: "{{ ssh_key_path }}.pub"
 
   pre_tasks:
-    - name: Generate SSH key on control node if not present
+    - name: Generate SSH key on control node if not exists
       delegate_to: localhost
-      run_once: true
       ansible.builtin.openssh_keypair:
         path: "{{ ssh_key_path }}"
-        type: rsa
         size: 4096
-      register: ssh_key
-
-    - name: Read public SSH key content
-      delegate_to: localhost
+        type: rsa
+      register: ssh_key_result
       run_once: true
+
+    - name: Read generated public key from control node
+      delegate_to: localhost
       ansible.builtin.slurp:
-        src: "{{ ssh_key_path }}.pub"
-      register: public_key_content
+        src: "{{ ssh_pub_key_path }}"
+      register: pubkey_content
+      run_once: true
+
+    - name: Add generated SSH public key to remote user's authorized_keys
+      ansible.builtin.authorized_key:
+        user: "{{ app_user }}"
+        key: "{{ pubkey_content.content | b64decode }}"
+      become: false
+
+    - name: Verify the remote OS is Debian
+      ansible.builtin.assert:
+        that:
+          - ansible_facts['os_family'] == "Debian"
+        fail_msg: "This playbook only supports Debian-based systems. Detected OS family: {{ ansible_facts['os_family'] }}"
+        success_msg: "Confirmed Debian-based system."
 
   tasks:
     - name: Ensure app user '{{ app_user }}' exists
@@ -36,13 +50,7 @@
         create_home: yes
         shell: /bin/bash
 
-    - name: Add control node public key to authorized_keys for '{{ app_user }}'
-      ansible.builtin.authorized_key:
-        user: "{{ app_user }}"
-        state: present
-        key: "{{ public_key_content.content | b64decode }}"
-
-    - name: Install Python3 and pip on Debian
+    - name: Install Python3, pip and venv on Debian
       ansible.builtin.apt:
         name:
           - python3
@@ -69,13 +77,11 @@
       notify:
         - Restart details_app service
 
-    - name: Install app dependencies with pip
+    - name: Install app dependencies with pip in virtualenv
       ansible.builtin.pip:
         requirements: "{{ app_home }}/requirements.txt"
-        executable: pip3
         virtualenv: "{{ app_home }}/venv"
         virtualenv_python: python3
-        virtualenv_command: python3 -m venv
         virtualenv_site_packages: no
         state: present
       become_user: "{{ app_user }}"
